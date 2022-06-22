@@ -1,3 +1,12 @@
+let call_wrapper_template = "
+################
+# Call wrapper #
+################
+function {function_name}
+    nu -c \"source {command_source}; {function_name} $argv\"
+end
+"
+
 # TODO: fix single arg
 let template_file = "set singlearg '^\\S+\\$'
 function __fishx_is_full_subcommand
@@ -18,12 +27,7 @@ function __fishx_is_full_subcommand
     return 1
 end
 
-################
-# Call wrapper #
-################
-function {function_name}
-    nu -c \"source ~/.config/nushell/config.nu; {function_name} $argv\"
-end
+{call_wrapper_code}
 
 ############################
 # Command tree completions #
@@ -86,9 +90,19 @@ def "nuwrap generate positional" [command: table, argument: table, argument_inde
     $'complete -c "($base_command)"($subcommand_filter)($description) -xk'
 }
 
+let custom_completion_template = "function __complete_{custom_completion_name}
+    nu -c 'source {command_source}; {custom_completion_command} | to text'
+end
+"
+def "nuwrap generate custom_completion_wrapper" [flag: table, --source (-s): string] {
+    let custom_completion_funcname = ($flag.custom_completion | str snake-case)
+    {custom_completion_name: $custom_completion_funcname, command_source: $source, custom_completion_command: $flag.custom_completion} | format $custom_completion_template
+}
+
 # TODO: take positional into account for subcommand_filter (otherwise flags wont show up)
-def "nuwrap generate flag" [command: table, flag: table] {
-    let description = if not ($flag.description | empty?) { $' -d "($flag.description)"'}
+def "nuwrap generate flag" [command: table, flag: table, --source (-s): string] {
+    let strip_description = if not ($flag.description | empty?) { $flag.description | str replace -a '"' '\"' }
+    let description = if not ($flag.description | empty?) { $' -d "($strip_description)"'}
     let base_command = get_base_command $command
     let subcommand_path = get_subcommands_chain_path $command
     let subcommand_filter = if ($command.command | str contains " ") {
@@ -96,10 +110,12 @@ def "nuwrap generate flag" [command: table, flag: table] {
     } else {
         ' -n "__fish_use_subcommand"'
     }
+    let completion_function = (if not ($flag.custom_completion | empty?) { nuwrap generate custom_completion_wrapper $flag --source $source })
+    let completion_flag = if not ($completion_function | empty?) { ($" -a '\(__complete_($flag.custom_completion | str snake-case)\)'") }
     let base = $'complete -c "($base_command)"($subcommand_filter)($description) -k'
     let short_flag = (if not ($flag.short_flag | empty?) { $' -s "($flag.short_flag)"' })
     let long_flag = ($' -l "($flag.parameter_name | str trim -r -c "?")"')
-    let flag_base = $'($base)($short_flag)($long_flag)'
+    let flag_base = $'($completion_function)($base)($short_flag)($long_flag)($completion_flag)'
     match $flag.parameter_type {
         named: {
             let ispath = (if ($flag.syntax_shape != "path") { " -f" } else { " -F" })
@@ -127,32 +143,46 @@ def "nuwrap generate command" [command: table] {
     $base
 }
 
-def "nuwrap generate completions" [command: table] {
+def "nuwrap generate completions" [command: table, --source: string] {
     let positional_completions = ($command.signature | where parameter_type == "positional" | each -n { | arg |
         nuwrap generate positional $command $arg.item $arg.index
     })
     let flag_completions = ($command.signature | where parameter_type != "positional" | each { | flag |
-        nuwrap generate flag $command $flag
+        nuwrap generate flag $command $flag --source $source
     })
-    let command_completions = (append $positional_completions | append $flag_completions | reduce { |l1, l2|
+    let command_completions = (append $positional_completions | append $flag_completions | reduce -f "" { |l1, l2|
         $"($l1)\n($l2)"
     })
     $"# ($command.command) completions\n($command_completions)"
 }
 
-def nuwrap [--command_name (-c): string] {
+def get_command_source [--source (-s): string] {
+    if ($source | empty?) {
+        $nu.config-path
+    } else {
+        let full_path = ($source | path expand)
+        $full_path
+    }
+}
+
+def nuwrap [
+    --command_name (-c): string,
+    --wrapper (-w): bool # force a wrapper creation
+    --source (-s): string # indicates source location instead of config.nu
+
+] {
     echo $"Wrapping command <($command_name)> to fish shell"
     let root_command = ($nu.scope.commands | where command == $command_name && is_sub == false)
     if ($root_command | empty?) {
         error make {msg: $"Command <($command_name)> not found"}
     }
-    let subcommands = ($nu.scope.commands | where command =^ $"($command_name) " && is_sub == true)
+    let subcommands = ($nu.scope.commands | where command starts-with $"($command_name) " && is_sub == true)
     let all_commands = ($subcommands | append $root_command)
 
     let commands_chains = ($subcommands | each { |it | get_subcommands_chain_combination $it } | flatten | uniq)
 
     let completions = ($all_commands | each { |current_command|
-        nuwrap generate completions $current_command
+        nuwrap generate completions $current_command --source (get_command_source -s $source)
     } | reduce { |l1, l2|
         $"($l1)\n\n($l2)"
     })
@@ -171,6 +201,14 @@ def nuwrap [--command_name (-c): string] {
         $"($l1)\n($l2)"
     })
     let output_file = $"/home/(whoami | str trim)/.config/fish/functions/($command_name).fish"
+    let root_command = ($root_command.0)
+    # Call wrapper
+    let should_create_call_wrapper = ($wrapper or (not $root_command.is_extern))
+    let call_wrapper_code_template_elements = {function_name: $command_name, command_source: (get_command_source -s $source)}
+    let call_wrapper_code = (if ($should_create_call_wrapper) { ($call_wrapper_code_template_elements | format $call_wrapper_template) } else { "# No wrapper required" })
+    # Completion script
+    let template_elements = {call_wrapper_code: $call_wrapper_code, command_tree_completions: $command_tree_completions, completions: $completions}
+    let script_content = (echo $template_elements | format $template_file)
+    echo $script_content | save $output_file
     echo $"Saved wrapper to ($output_file)"
-    {function_name: $command_name, command_tree_completions: $command_tree_completions, completions: $completions} | format $template_file | save $output_file
 }
